@@ -1,11 +1,19 @@
 # ============================================================
-# ai_analyst.py - Gemini Pro 기반 AI 뉴스 분석 & 투자 의견
+# ai_analyst.py - Gemini Pro 기반 AI 뉴스 분석 & 투자 의견 (신뢰도 개선)
 # ============================================================
 import google.generativeai as genai
 from duckduckgo_search import DDGS
-from config import GOOGLE_API_KEY
-import json, re
-from datetime import datetime
+from config import GOOGLE_API_KEY, AI_CONFIDENCE_THRESHOLD, AI_CACHE_HOURS
+import json, re, os
+from datetime import datetime, timedelta
+import hashlib
+import logging
+
+logger = logging.getLogger("StockAI.AIAnalyst")
+
+# ── AI 의견 캐시 ───────────────────────────────────────
+CACHE_DIR = "ai_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 
 def _configure_gemini():
@@ -37,16 +45,31 @@ def analyze_with_gemini(stock_name: str, ticker: str,
                         fund: dict, val_result: dict,
                         wave_result: dict) -> dict:
     """
-    Gemini에게 종목 종합 분석 요청.
-    반환: {opinion, summary, bull_points, bear_points, risk_level, confidence}
+    Gemini에게 종목 종합 분석 요청 (신뢰도 개선).
+    반환: {opinion, summary, bull_points, bear_points, risk_level, confidence, credibility_score}
     """
     if not GOOGLE_API_KEY:
         return {
             "opinion": "API 키 없음",
             "summary": "GOOGLE_API_KEY를 .env에 설정하면 AI 분석이 활성화됩니다.",
             "bull_points": [], "bear_points": [],
-            "risk_level": "알수없음", "confidence": 0
+            "risk_level": "알수없음", "confidence": 0,
+            "credibility_score": 0,
         }
+
+    # 캐시 확인
+    cache_key = hashlib.md5(f"{ticker}_{datetime.now().date()}".encode()).hexdigest()
+    cache_file = os.path.join(CACHE_DIR, f"{cache_key}.json")
+    
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+                if (datetime.now() - datetime.fromisoformat(cached.get("timestamp", ""))).seconds < AI_CACHE_HOURS * 3600:
+                    logger.info(f"캐시에서 AI 의견 로드: {ticker}")
+                    return cached["result"]
+        except Exception as e:
+            logger.warning(f"캐시 로드 실패: {e}")
 
     # 뉴스 수집
     news_list = search_news(f"{stock_name} 주가 실적 전망 2025", max_results=5)
@@ -115,24 +138,105 @@ def analyze_with_gemini(stock_name: str, ticker: str,
             result = json.loads(text)
 
         result["news"] = news_list[:3]
+        
+        # 신뢰도 점수 계산 및 검증
+        result["credibility_score"] = _calculate_credibility(result, val_result, fund)
+        result["timestamp"] = datetime.now().isoformat()
+        
+        # 낮은 신뢰도 경고
+        if result["credibility_score"] < AI_CONFIDENCE_THRESHOLD:
+            result["warning"] = f"⚠️ 신뢰도 {result['credibility_score']:.0f}% - 데이터 확인 후 투자 결정 권장"
+        
+        # 캐시 저장
+        _save_cache(cache_file, result)
+        
         return result
 
     except json.JSONDecodeError:
-        return {
+        fallback = {
             "opinion": signal,
             "summary": f"AI 분석 중 파싱 오류. 퀀트 시그널: {signal}",
             "bull_points": [], "bear_points": [],
             "risk_level": "보통", "confidence": 40,
-            "news": news_list[:3]
+            "credibility_score": 35,
+            "news": news_list[:3],
+            "warning": "⚠️ AI 응답 파싱 실패. 정량 신호 참조"
         }
+        return fallback
     except Exception as e:
-        return {
+        fallback = {
             "opinion": signal,
             "summary": f"AI 분석 오류: {str(e)[:100]}",
             "bull_points": [], "bear_points": [],
             "risk_level": "보통", "confidence": 0,
-            "news": news_list[:3]
+            "credibility_score": 30,
+            "news": news_list[:3],
+            "warning": "⚠️ AI 분석 실패. 정량 신호 참조"
         }
+        logger.error(f"AI 분석 실패: {e}")
+        return fallback
+
+
+def _calculate_credibility(ai_opinion: dict, val_result: dict, fund: dict) -> float:
+    """
+    AI 의견의 신뢰도 점수 계산 (0~100).
+    신호 일관성, 데이터 품질, 펀더멘털 정렬도를 점수화.
+    """
+    score = 100
+    
+    # 1. 신뢰도 자체 점수 (AI가 제시한)
+    ai_confidence = ai_opinion.get("confidence", 50)
+    if ai_confidence < 50:
+        score -= 20
+    
+    # 2. 데이터 완성도 점수
+    data_quality = 0
+    checks = [
+        val_result.get("fair_value") is not None,
+        fund.get("per") is not None,
+        fund.get("roe") is not None,
+        len(ai_opinion.get("bull_points", [])) > 0,
+    ]
+    data_quality = sum(checks) / len(checks) * 30
+    score += data_quality - 30  # -30 ~ 0
+    
+    # 3. 의견 일관성 확인
+    opinion = ai_opinion.get("opinion", "")
+    sm = val_result.get("safety_margin")
+    
+    # 안전마진과 의견의 일관성 검증
+    if sm is not None:
+        opinion_matches = False
+        if sm > 20 and opinion in ["Strong Buy", "Buy"]:
+            opinion_matches = True
+        elif 15 <= sm <= 20 and opinion in ["Buy", "Weak Buy"]:
+            opinion_matches = True
+        elif -10 <= sm < 15 and opinion in ["Weak Buy", "Hold"]:
+            opinion_matches = True
+        elif -30 <= sm < -10 and opinion in ["Hold", "Weak Sell"]:
+            opinion_matches = True
+        elif sm < -30 and opinion in ["Weak Sell", "Sell"]:
+            opinion_matches = True
+        
+        if not opinion_matches:
+            score -= 15  # 일관성 없으면 -15
+    
+    # 4. PER 현실성 검증
+    per = fund.get("per")
+    if per is not None:
+        if per < 0 or per > 100 and ai_opinion.get("opinion") == "Strong Buy":
+            score -= 10  # 비정상적인 PER과 강한 의견 = 신뢰도 감소
+    
+    return max(0, min(100, score))
+
+
+def _save_cache(cache_file: str, result: dict) -> None:
+    """AI 의견을 파일로 캐시."""
+    try:
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump({"timestamp": datetime.now().isoformat(), "result": result}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"캐시 저장 실패: {e}")
 
 
 def quick_opinion(signal: str, safety_margin: float) -> str:

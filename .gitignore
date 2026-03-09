@@ -1,6 +1,62 @@
+# Python
 __pycache__/
 *.pyc
-.env
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual Environments
 venv/
 .venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Data & Logs
+logs/
+*.log
+cache/
+*.csv
+!watchlist.csv  # 이건 유지
+
+# Docker
+.dockerignore
+docker-compose.override.yml
+
+# Streamlit
+.streamlit/secrets.toml
+.streamlit/cache/
+
+# Database
+*.db
+*.sqlite
+postgres_data/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Coverage
+.coverage
+htmlcov/
+
+# Package lock files (선택)
+# poetry.lock
+# Pipfile.lock

@@ -13,3 +13,5 @@ scipy>=1.11.0
 tqdm>=4.66.0
 finance-datareader>=0.9.50
 beautifulsoup4>=4.12.0
+pykrx>=1.0.20
+FinanceDataReader>=1.9.8

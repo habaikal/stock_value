@@ -1,5 +1,5 @@
 # ============================================================
-# app.py - Streamlit 메인 웹앱 (StockValuationAI)
+# app.py - Streamlit 멀티페이지 웹앱 (StockValuationAI Pro)
 # ============================================================
 import streamlit as st
 import pandas as pd
@@ -7,20 +7,27 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
-import warnings, time
+import warnings, time, logging
 warnings.filterwarnings("ignore")
 
 from stock_manager  import add_stock, remove_stock, get_watchlist, update_name
 from data_collector import fetch_price_history, fetch_fundamentals, fetch_current_price
+from data_collector import fetch_foreign_institutional_trades, fetch_korea_price_with_fdr
 from wave_analyzer  import calculate_indicators, classify_wave, get_support_resistance
 from valuation_engine import calculate_fair_value, build_scorecard
 from ai_analyst     import analyze_with_gemini, quick_opinion
+from portfolio_manager import Portfolio, export_portfolio_report
+from backtest_engine import BacktestEngine
+from logger_config import setup_logger
+
+# 로거 설정
+logger = setup_logger()
 
 # ─────────────────────────────────────────────────────────────
-# 페이지 설정
+# 페이지 설정 (멀티페이지 지원)
 # ─────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="🥝 StockAI 적정주가 분석",
+    page_title="🥝 StockAI Pro - 적정주가 분석",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -558,7 +565,7 @@ def render_scorecard(score):
 
 
 def render_ai_analysis(fund, val, wave, ticker, use_ai: bool):
-    st.markdown('<p class="section-header">🤖 AI 애널리스트 의견 (Gemini)</p>', unsafe_allow_html=True)
+    st.markdown('<p class="section-header">🤖 AI 애널리스트 의견 (Gemini Pro)</p>', unsafe_allow_html=True)
 
     if use_ai:
         with st.spinner("🔍 Gemini가 뉴스와 데이터를 분석 중..."):
@@ -567,11 +574,24 @@ def render_ai_analysis(fund, val, wave, ticker, use_ai: bool):
                 fund, val, wave
             )
 
-        # 의견 표시
+        # 의견 + 신뢰도 표시
         opinion = ai.get("opinion", "Hold")
+        credibility = ai.get("credibility_score", 50)
         css = signal_class(opinion)
+        
+        # 신뢰도 시각화
+        credibility_bar = "🟢" * int(credibility / 10) + "⬜" * (10 - int(credibility / 10))
         st.markdown(f'<div class="signal-box {css}">🤖 AI 의견: {opinion}</div>',
                     unsafe_allow_html=True)
+        
+        st.write(f"**신뢰도 점수**: {credibility_bar} {credibility:.0f}%")
+        
+        # 신뢰도 경고 메시지
+        if "warning" in ai:
+            st.warning(ai["warning"])
+        
+        if credibility < 50:
+            st.info("⚠️ 낮은 신뢰도. 정량 신호와 함께 검토하세요.")
 
         if ai.get("target_price"):
             st.metric("AI 목표주가", fmt_price(ai.get("target_price")))
@@ -595,7 +615,7 @@ def render_ai_analysis(fund, val, wave, ticker, use_ai: bool):
 
         col3, col4, col5 = st.columns(3)
         col3.metric("리스크 수준", ai.get("risk_level", "보통"))
-        col4.metric("분석 신뢰도", f"{ai.get('confidence', 0)}%")
+        col4.metric("AI 신뢰도", f"{ai.get('confidence', 0)}%")
         col5.metric("추천 보유기간", ai.get("holding_period", "중기"))
 
         # 뉴스
@@ -706,17 +726,18 @@ def main():
     st.sidebar.markdown("---")
     use_ai = st.sidebar.checkbox(
         "🤖 AI 분석 사용 (Gemini)",
-        value=bool(GOOGLE_API_KEY if hasattr(__import__('config'), 'GOOGLE_API_KEY') else False),
+        value=bool(getattr(__import__('config'), 'GOOGLE_API_KEY', False)),
         help="GOOGLE_API_KEY 필요. .env 파일에 설정하세요."
     )
 
-    # 탭 구성
-    tab_main, tab_wave, tab_score, tab_ai, tab_portfolio = st.tabs([
+    # 탭 구성 (포트폴리오, 백테스팅 추가)
+    tab_main, tab_wave, tab_score, tab_ai, tab_portfolio, tab_backtest = st.tabs([
         "💰 적정주가 분석",
         "🌊 파동·기술 분석",
         "🏆 스코어카드",
         "🤖 AI 애널리스트",
-        "📋 포트폴리오 뷰"
+        "📈 포트폴리오",
+        "📊 백테스팅"
     ])
 
     # 데이터 로딩 (캐시)
@@ -746,7 +767,174 @@ def main():
         render_ai_analysis(fund, val, wave, selected_ticker, use_ai)
 
     with tab_portfolio:
-        render_watchlist_table()
+        render_portfolio_management(selected_ticker, fund.get("current_price"))
+
+    with tab_backtest:
+        render_backtest_analysis(selected_ticker)
+
+
+# ──────────────────────────────────────────────────────────────
+# 포트폴리오 관리 렌더링
+# ──────────────────────────────────────────────────────────────
+def render_portfolio_management(ticker: str, current_price: float | None) -> None:
+    """포트폴리오 관리 UI."""
+    st.markdown("### 📈 포트폴리오 관리")
+    
+    portfolio = Portfolio()
+    current_value = portfolio.get_current_value()
+    allocation = portfolio.get_allocation()
+    stats = portfolio.get_performance_stats()
+    
+    # 자산 요약
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("총자산", f"₩{current_value['total_value']:,.0f}", 
+                  f"{current_value['return_rate']:.2f}%", delta_color="normal")
+    with col2:
+        st.metric("증권가액", f"₩{current_value['securities_value']:,.0f}")
+    with col3:
+        st.metric("현금", f"₩{current_value['cash']:,.0f}")
+    with col4:
+        st.metric("보유종목", allocation.get("num_holdings", 0))
+    
+    # 거래 UI
+    st.divider()
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("💳 매수")
+        ticker_input = st.text_input("종목코드", value=ticker, key="buy_ticker")
+        shares = st.number_input("수량 (주)", min_value=1, step=1, key="buy_shares")
+        price = st.number_input("매수가 (원)", min_value=1, step=100, 
+                               value=int(current_price) if current_price else 10000,
+                               key="buy_price")
+        
+        if st.button("🟢 매수 실행"):
+            result = portfolio.buy(ticker_input, shares, price)
+            if result["status"] == "success":
+                st.success(f"✅ {ticker_input} {shares}주 매수 완료\n남은 자금: ₩{result['cash_left']:,.0f}")
+                st.rerun()
+            else:
+                st.error(f"❌ {result['status']}: 필요 {result['required']:,.0f}원, 보유 {result['available']:,.0f}원")
+    
+    with col2:
+        st.subheader("📤 매도")
+        ticker_sell = st.text_input("종목코드", key="sell_ticker")
+        shares_sell = st.number_input("수량 (주)", min_value=1, step=1, key="sell_shares")
+        price_sell = st.number_input("매도가 (원)", min_value=1, step=100, value=10000, key="sell_price")
+        
+        if st.button("🔴 매도 실행"):
+            result = portfolio.sell(ticker_sell, shares_sell, price_sell)
+            if result["status"] == "success":
+                st.success(f"✅ {ticker_sell} {shares_sell}주 매도 완료\n순수익: ₩{result['proceeds']:,.0f} "
+                          f"(수익률: {result['gain_pct']:.2f}%)")
+                st.rerun()
+            else:
+                st.error(f"❌ {result['status']}: 보유 {result['available']:.0f}주")
+    
+    # 보유 종목 현황
+    st.divider()
+    st.subheader("📊 보유 종목")
+    if current_value["details"]:
+        df_holdings = pd.DataFrame(current_value["details"])
+        st.dataframe(df_holdings, use_container_width=True)
+    else:
+        st.info("보유 종목 없음")
+    
+    # 성과통계
+    st.divider()
+    st.subheader("🎯 성과통계")
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("총 거래", stats.get("trades", 0))
+    with col2:
+        st.metric("승률", f"{stats.get('win_rate', 0):.1f}%")
+    with col3:
+        st.metric("평균손익", f"₩{stats.get('avg_gain', 0):,.0f}")
+    with col4:
+        st.metric("최대수익", f"₩{stats.get('total_gain', 0):,.0f}")
+    
+    # 거래 이력
+    if st.checkbox("거래 이력 보기"):
+        history = portfolio.get_transaction_history()
+        if history:
+            df_history = pd.DataFrame(history)
+            st.dataframe(df_history, use_container_width=True)
+
+
+# ──────────────────────────────────────────────────────────────
+# 백테스팅 렌더링
+# ──────────────────────────────────────────────────────────────
+def render_backtest_analysis(ticker: str) -> None:
+    """백테스팅 분석 UI."""
+    st.markdown("### 📊 신호 백테스팅")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date = st.date_input("시작일", value=pd.to_datetime("2023-01-01").date())
+    with col2:
+        end_date = st.date_input("종료일", value=pd.to_datetime("2026-03-10").date())
+    
+    if st.button("▶️ 백테스트 실행", key="backtest_run"):
+        with st.spinner(f"🔄 {ticker} 백테스팅 중..."):
+            engine = BacktestEngine(
+                ticker,
+                start_date=start_date.strftime("%Y-%m-%d"),
+                end_date=end_date.strftime("%Y-%m-%d")
+            )
+            results = engine.run()
+            
+            if results and "error" not in results:
+                # 성과 메트릭스
+                col1, col2, col3, col4, col5 = st.columns(5)
+                with col1:
+                    st.metric("수익률", f"{results['total_return']:.2f}%")
+                with col2:
+                    st.metric("CAGR", f"{results['cagr']:.2f}%")
+                with col3:
+                    st.metric("최대낙폭", f"{results['mdd']:.2f}%")
+                with col4:
+                    st.metric("Sharpe 지수", f"{results['sharpe_ratio']:.2f}")
+                with col5:
+                    st.metric("거래수", results["num_trades"])
+                
+                st.divider()
+                
+                # 일일 포트폴리오 가치 차트
+                df_daily = pd.DataFrame(results["daily_values"])
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=df_daily["date"],
+                    y=df_daily["portfolio_value"],
+                    mode="lines",
+                    name="포트폴리오 가치",
+                    line=dict(color="#3b82f6", width=2)
+                ))
+                fig.update_layout(
+                    title=f"{ticker} 백테스팅 성과",
+                    xaxis_title="날짜",
+                    yaxis_title="자산가치 (원)",
+                    hovermode="x unified",
+                    template="plotly_dark"
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # 거래 기록
+                if results["trades"]:
+                    st.divider()
+                    st.subheader("📋 거래 기록")
+                    df_trades = pd.DataFrame(results["trades"])
+                    st.dataframe(df_trades, use_container_width=True)
+                
+                # 결과 저장
+                if st.button("💾 결과 저장"):
+                    engine.save_results(results)
+                    st.success("✅ 백테스팅 결과 저장됨")
+            else:
+                st.error("❌ 백테스팅 실패")
+
+
+# ──────────────────────────────────────────────────────────────
 
 
 if __name__ == "__main__":
